@@ -90,7 +90,3 @@ pubspec.yaml          Dependencies and assets
 ## Disclaimer
 
 TathBeat is an independent project and isn't affiliated with or endorsed by YouTube or Google. Videos play through YouTube's official embedded player, and their content belongs to their owners.
-
-## License
-
-Choose a license for your project (for example [MIT](https://choosealicense.com/licenses/mit/)) and add a `LICENSE` file, then replace this line with its name.
