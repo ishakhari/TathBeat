@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:youtube_player_iframe/youtube_player_iframe.dart';
 
 void main() => runApp(const LoopApp());
@@ -53,6 +55,9 @@ class _LooperPageState extends State<LooperPage> {
   static const _speeds = [0.75, 1.0, 1.25, 1.5, 2.0];
   String? _error;
   int _lastCommittedStart = 0;
+  String _loadedUrl = ''; // link of the video currently loaded
+  int? _pendingStart; // start/end to apply once the duration is known
+  int? _pendingEnd;
 
   @override
   void dispose() {
@@ -140,13 +145,16 @@ class _LooperPageState extends State<LooperPage> {
   }
 
 
-  void _loadVideo() {
+  void _loadVideo({int? restoreStart, int? restoreEnd}) {
     FocusScope.of(context).unfocus();
     final id = _extractVideoId(_urlCtl.text);
     if (id == null) {
       setState(() => _error = 'Cela ne ressemble pas à un lien YouTube.');
       return;
     }
+    _loadedUrl = _urlCtl.text.trim();
+    _pendingStart = restoreStart;
+    _pendingEnd = restoreEnd;
     _initTimer?.cancel();
     for (final s in _subs) {
       s.cancel();
@@ -213,11 +221,16 @@ class _LooperPageState extends State<LooperPage> {
       if (d > 0) {
         c.pauseVideo();
         c.setPlaybackRate(_speed);
-        _seek(0);
+        final s0 = (_pendingStart ?? 0).clamp(0, d - 1);
+        final e0 = (_pendingEnd ?? d).clamp(s0 + 1, d);
+        _pendingStart = null;
+        _pendingEnd = null;
+        _seek(s0);
         setState(() {
           _total = d;
-          _start = 0;
-          _end = d;
+          _start = s0;
+          _end = e0;
+          _lastCommittedStart = s0;
           _isPlaying = false;
           _position = 0;
           _syncFields();
@@ -315,6 +328,62 @@ class _LooperPageState extends State<LooperPage> {
     });
   }
 
+  // ---------- favorites ----------
+
+  String _defaultName() {
+    const days = [
+      'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'dimanche'
+    ];
+    const months = [
+      'janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet',
+      'août', 'septembre', 'octobre', 'novembre', 'décembre'
+    ];
+    final n = DateTime.now();
+    return 'Écoute ${days[n.weekday - 1]} ${n.day} ${months[n.month - 1]}';
+  }
+
+  Future<void> _saveFavorite() async {
+    if (_loadedUrl.isEmpty || _total == 0) return;
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) => _NameDialog(
+        title: 'Enregistrer cette écoute',
+        initial: _defaultName(),
+        confirmLabel: 'Enregistrer',
+      ),
+    );
+    if (name == null) return;
+    final items = await FavoritesStore.load();
+    items.insert(
+      0,
+      Favorite(
+        id: DateTime.now().microsecondsSinceEpoch.toString(),
+        name: name,
+        url: _loadedUrl,
+        start: _start,
+        end: _end,
+      ),
+    );
+    await FavoritesStore.save(items);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('« $name » enregistré')),
+    );
+  }
+
+  Future<void> _openFavorites() async {
+    final fav = await Navigator.of(context).push<Favorite>(
+      MaterialPageRoute(builder: (_) => const FavoritesPage()),
+    );
+    if (fav != null && mounted) _applyFavorite(fav);
+  }
+
+  void _applyFavorite(Favorite f) {
+    _urlCtl.text = f.url;
+    setState(() => _error = null);
+    _loadVideo(restoreStart: f.start, restoreEnd: f.end);
+  }
+
   // ---------- UI ----------
 
   @override
@@ -326,6 +395,13 @@ class _LooperPageState extends State<LooperPage> {
       appBar: AppBar(
         title: const _BrandTitle(),
         backgroundColor: Colors.transparent,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.bookmarks_outlined),
+            tooltip: 'Mes écoutes sauvegardées',
+            onPressed: _openFavorites,
+          ),
+        ],
       ),
       body: SafeArea(
         child: ListView(
@@ -528,6 +604,18 @@ class _LooperPageState extends State<LooperPage> {
                     ),
                 ],
               ),
+              const SizedBox(height: 24),
+              FilledButton.tonalIcon(
+                onPressed: _saveFavorite,
+                icon: const Icon(Icons.bookmark_add_outlined),
+                label: const Text('Enregistrer cette écoute'),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size.fromHeight(52),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+              ),
             ],
           ],
         ),
@@ -608,6 +696,247 @@ class _BrandTitle extends StatelessWidget {
             style: TextStyle(fontWeight: FontWeight.w700, letterSpacing: -0.5),
           ),
         ),
+      ],
+    );
+  }
+}
+
+
+// ======================= Favorites =======================
+
+String formatSeconds(int seconds) {
+  final h = seconds ~/ 3600;
+  final m = (seconds % 3600) ~/ 60;
+  final s = (seconds % 60).toString().padLeft(2, '0');
+  if (h > 0) return '$h:${m.toString().padLeft(2, '0')}:$s';
+  return '$m:$s';
+}
+
+class Favorite {
+  Favorite({
+    required this.id,
+    required this.name,
+    required this.url,
+    required this.start,
+    required this.end,
+  });
+
+  final String id;
+  String name;
+  final String url;
+  final int start; // seconds
+  final int end; // seconds
+
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'name': name, 'url': url, 'start': start, 'end': end};
+
+  factory Favorite.fromJson(Map<String, dynamic> j) => Favorite(
+    id: j['id'] as String,
+    name: j['name'] as String,
+    url: j['url'] as String,
+    start: j['start'] as int,
+    end: j['end'] as int,
+  );
+}
+
+class FavoritesStore {
+  static const _key = 'favorites_v1';
+
+  static Future<List<Favorite>> load() async {
+    final p = await SharedPreferences.getInstance();
+    final raw = p.getString(_key);
+    if (raw == null) return [];
+    try {
+      final list = jsonDecode(raw) as List;
+      return list
+          .map((e) => Favorite.fromJson(Map<String, dynamic>.from(e as Map)))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static Future<void> save(List<Favorite> items) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString(_key, jsonEncode(items.map((e) => e.toJson()).toList()));
+  }
+}
+
+class FavoritesPage extends StatefulWidget {
+  const FavoritesPage({super.key});
+
+  @override
+  State<FavoritesPage> createState() => _FavoritesPageState();
+}
+
+class _FavoritesPageState extends State<FavoritesPage> {
+  List<Favorite>? _items;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final l = await FavoritesStore.load();
+    if (mounted) setState(() => _items = l);
+  }
+
+  Future<void> _rename(Favorite f) async {
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) => _NameDialog(
+        title: 'Renommer',
+        initial: f.name,
+        confirmLabel: 'OK',
+      ),
+    );
+    if (name == null) return;
+    setState(() => f.name = name);
+    await FavoritesStore.save(_items!);
+  }
+
+  Future<void> _delete(Favorite f) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Supprimer ?'),
+        content: Text('« ${f.name} » sera supprimé.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Annuler'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Supprimer'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _items!.remove(f));
+    await FavoritesStore.save(_items!);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final items = _items;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Mes écoutes sauvegardées'),
+        backgroundColor: Colors.transparent,
+      ),
+      body: items == null
+          ? const Center(child: CircularProgressIndicator())
+          : items.isEmpty
+          ? const Center(
+        child: Padding(
+          padding: EdgeInsets.all(32),
+          child: Text(
+            'Aucune écoute sauvegardée.\n'
+                'Charge une vidéo, règle ton début et ta fin, '
+                'puis appuie sur « Enregistrer cette écoute ».',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.white70),
+          ),
+        ),
+      )
+          : ListView.separated(
+        padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+        itemCount: items.length,
+        separatorBuilder: (_, __) => const SizedBox(height: 8),
+        itemBuilder: (context, i) {
+          final f = items[i];
+          return Card(
+            margin: EdgeInsets.zero,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: ListTile(
+              contentPadding:
+              const EdgeInsets.fromLTRB(16, 6, 4, 6),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+              ),
+              leading: const Icon(Icons.bookmark),
+              title: Text(f.name,
+                  style:
+                  const TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: Text(
+                '${formatSeconds(f.start)} → ${formatSeconds(f.end)}'
+                    '  ·  ${f.url}',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+              onTap: () => Navigator.pop(context, f),
+              trailing: PopupMenuButton<String>(
+                onSelected: (v) =>
+                v == 'rename' ? _rename(f) : _delete(f),
+                itemBuilder: (_) => const [
+                  PopupMenuItem(
+                      value: 'rename', child: Text('Renommer')),
+                  PopupMenuItem(
+                      value: 'delete', child: Text('Supprimer')),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _NameDialog extends StatefulWidget {
+  const _NameDialog({
+    required this.title,
+    required this.initial,
+    required this.confirmLabel,
+  });
+
+  final String title;
+  final String initial;
+  final String confirmLabel;
+
+  @override
+  State<_NameDialog> createState() => _NameDialogState();
+}
+
+class _NameDialogState extends State<_NameDialog> {
+  late final TextEditingController _ctl =
+  TextEditingController(text: widget.initial);
+
+  @override
+  void dispose() {
+    _ctl.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final n = _ctl.text.trim();
+    if (n.isEmpty) return;
+    Navigator.pop(context, n);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.title),
+      content: TextField(
+        controller: _ctl,
+        autofocus: true,
+        textInputAction: TextInputAction.done,
+        onSubmitted: (_) => _submit(),
+        decoration: const InputDecoration(labelText: 'Nom'),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Annuler'),
+        ),
+        FilledButton(onPressed: _submit, child: Text(widget.confirmLabel)),
       ],
     );
   }
